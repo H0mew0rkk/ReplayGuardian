@@ -34,6 +34,7 @@ const CANCEL: u16 = 114;
 const PAUSE: u16 = 115;
 const EXIT: u16 = 116;
 const SETTINGS: u16 = 117;
+const SHOW_SETTINGS: u32 = WM_APP + 4;
 struct App {
     config: Config,
     paused: bool,
@@ -45,6 +46,9 @@ struct App {
     scale: f64,
     safe: bool,
     theme: Option<crate::ui_style::Theme>,
+    icon: crate::tray::Icon,
+    #[cfg(test)]
+    test_tray: Option<bool>,
 }
 // This small wrapper mirrors CreateWindowEx's native control geometry.
 #[allow(clippy::too_many_arguments)]
@@ -353,6 +357,7 @@ impl App {
             (TEST, "测试检测方式", 28, 150),
             (CALIBRATE, "校验注册表…", 190, 160),
             (CANCEL, "取消校验", 362, 116),
+            (EXIT, "退出程序", 490, 122),
         ] {
             put(id, "BUTTON", label, x, 548, w, 32, WS_TABSTOP, theme.body);
         }
@@ -414,9 +419,12 @@ impl App {
                 self.snapshot.state.label().trim_start_matches("状态")
             )
         };
+        self.tray(hwnd, false);
         if self.controls.is_empty() {
-            self.tray(hwnd, false);
-            return;
+            if self.tray_added {
+                return;
+            }
+            self.build(hwnd);
         }
         if let Some(theme) = &self.theme {
             for id in [STATUS, 118] {
@@ -461,16 +469,37 @@ impl App {
             i32::from(self.snapshot.calibration > 0 && !self.safe),
         );
         InvalidateRect(hwnd, null(), 0);
-        self.tray(hwnd, false);
+        if !self.tray_added {
+            SetWindowTextW(
+                self.controls[&DETAIL],
+                wide("托盘图标暂不可用，设置窗口将保持可访问。可以直接点击“退出程序”。").as_ptr(),
+            );
+            if IsWindowVisible(hwnd) == 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
     }
-    unsafe fn tray(&mut self, hwnd: HWND, add: bool) {
+    unsafe fn show_settings(&mut self, hwnd: HWND) {
+        if self.controls.is_empty() {
+            self.build(hwnd);
+        }
+        self.update(hwnd);
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+    unsafe fn tray(&mut self, hwnd: HWND, add: bool) -> bool {
+        #[cfg(test)]
+        if let Some(available) = self.test_tray {
+            self.tray_added = available;
+            return available;
+        }
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
         data.cbSize = std::mem::size_of_val(&data) as u32;
         data.hWnd = hwnd;
         data.uID = 1;
         data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = TRAY;
-        data.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+        data.hIcon = self.icon.0;
         let tip = wide(&format!(
             "Replay Guardian：{} · {}{}",
             self.snapshot.state.label(),
@@ -479,9 +508,14 @@ impl App {
         ));
         let n = tip.len().min(data.szTip.len() - 1);
         data.szTip[..n].copy_from_slice(&tip[..n]);
-        if Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &data) != 0 {
-            self.tray_added = true;
+        let previous = self.tray_added;
+        self.tray_added = crate::tray::ensure_icon(previous, add, |operation| {
+            Shell_NotifyIconW(operation, &data) != 0
+        });
+        if !self.tray_added && (add || previous) {
+            config::log_error("系统托盘图标注册失败，保留设置窗口作为入口");
         }
+        self.tray_added
     }
     unsafe fn balloon(&self, hwnd: HWND) {
         let mut data: NOTIFYICONDATAW = std::mem::zeroed();
@@ -605,6 +639,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
         DestroyWindow(hwnd);
         return 0;
     }
+    // Cross-instance activation can arrive while native code re-enters a borrowed
+    // window callback. Queue it first instead of silently dropping the request.
+    if message == WM_COMMAND && (w & 0xffff) as u16 == SETTINGS {
+        PostMessageW(hwnd, SHOW_SETTINGS, 0, 0);
+        return 1;
+    }
     if matches!(
         message,
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT
@@ -616,14 +656,50 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
     if ptr.is_null() {
         return DefWindowProcW(hwnd, message, w, l);
     }
+    // DefWindowProc handles SC_CLOSE by synchronously sending WM_CLOSE. Holding
+    // an App borrow across it made that nested callback fall through to default
+    // destruction, leaving a windowless process holding the single-instance lock.
+    if !matches!(
+        message,
+        SHOW_SETTINGS
+            | WM_PAINT
+            | WM_ERASEBKGND
+            | WM_CLOSE
+            | WM_DESTROY
+            | monitor::UPDATE
+            | TRAY
+            | WM_COMMAND
+    ) {
+        let taskbar = (*ptr)
+            .try_borrow()
+            .is_ok_and(|app| app.taskbar != 0 && message == app.taskbar);
+        if !taskbar {
+            return DefWindowProcW(hwnd, message, w, l);
+        }
+    }
     let Ok(mut app) = (*ptr).try_borrow_mut() else {
+        if message == WM_CLOSE {
+            return 0;
+        }
+        if message == WM_DESTROY {
+            PostQuitMessage(0);
+            return 0;
+        }
         return DefWindowProcW(hwnd, message, w, l);
     };
     if message == app.taskbar && app.taskbar != 0 {
+        app.tray_added = false;
         app.tray(hwnd, true);
+        if !app.tray_added {
+            app.show_settings(hwnd);
+        }
         return 0;
     }
     match message {
+        SHOW_SETTINGS => {
+            app.show_settings(hwnd);
+            1
+        }
         WM_PAINT if app.theme.is_some() => {
             app.theme
                 .as_ref()
@@ -633,7 +709,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
         }
         WM_ERASEBKGND if app.theme.is_some() => 1,
         WM_CLOSE => {
-            ShowWindow(hwnd, SW_HIDE);
+            if app.tray(hwnd, false) {
+                ShowWindow(hwnd, SW_HIDE);
+            } else {
+                app.show_settings(hwnd);
+            }
             0
         }
         WM_DESTROY => {
@@ -653,13 +733,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
         TRAY => {
             if l as u32 == WM_RBUTTONUP {
                 app.menu(hwnd);
-            } else if l as u32 == WM_LBUTTONDBLCLK {
-                if app.controls.is_empty() {
-                    app.build(hwnd);
-                    app.update(hwnd);
-                }
-                ShowWindow(hwnd, SW_SHOW);
-                SetForegroundWindow(hwnd);
+            } else if matches!(l as u32, WM_LBUTTONUP | WM_LBUTTONDBLCLK | NIN_SELECT) {
+                app.show_settings(hwnd);
             }
             0
         }
@@ -672,14 +747,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         worker.send(Command::Exit);
                     }
                     PostMessageW(hwnd, WM_APP + 3, 0, 0);
-                }
-                SETTINGS => {
-                    if app.controls.is_empty() {
-                        app.build(hwnd);
-                        app.update(hwnd);
-                    }
-                    ShowWindow(hwnd, SW_SHOW);
-                    SetForegroundWindow(hwnd);
                 }
                 PAUSE => {
                     app.paused = !app.paused;
@@ -721,9 +788,54 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             }
             0
         }
-        _ => DefWindowProcW(hwnd, message, w, l),
+        _ => {
+            drop(app);
+            DefWindowProcW(hwnd, message, w, l)
+        }
     }
 }
+unsafe fn activate_existing(class: &str) -> Result<(), String> {
+    // Bounded startup-only wait: the mutex is created before its window exists.
+    let mut hwnd = null_mut();
+    for _ in 0..20 {
+        hwnd = FindWindowW(wide(class).as_ptr(), null());
+        if !hwnd.is_null() {
+            break;
+        }
+        Sleep(100);
+    }
+    if hwnd.is_null() {
+        return Err("已有 Replay Guardian 后台实例，但未找到设置窗口。可能是旧版残留进程；请在任务管理器结束 ReplayGuardian 后再打开新版。".into());
+    }
+    let mut pid = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    AllowSetForegroundWindow(pid);
+    let mut result = 0;
+    if SendMessageTimeoutW(
+        hwnd,
+        WM_COMMAND,
+        SETTINGS as usize,
+        0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        2000,
+        &mut result,
+    ) == 0
+    {
+        return Err(
+            "正在运行的 Replay Guardian 没有响应窗口打开请求。请结束旧实例后再打开新版。".into(),
+        );
+    }
+    ShowWindowAsync(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+    for _ in 0..20 {
+        if IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+            return Ok(());
+        }
+        Sleep(100);
+    }
+    Err("已向后台实例发送打开请求，但窗口仍未显示。请结束旧实例后重试。".into())
+}
+
 pub fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(index) = args.iter().position(|a| a == "--diagnose") {
@@ -765,12 +877,7 @@ pub fn run() -> Result<(), String> {
             return Err(last_error("单实例检查"));
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let hwnd = FindWindowW(wide(window_class).as_ptr(), null());
-            if !hwnd.is_null() {
-                PostMessageW(hwnd, WM_COMMAND, SETTINGS as usize, 0);
-                SetForegroundWindow(hwnd);
-            }
-            return Ok(());
+            return activate_existing(window_class);
         }
         SetProcessDPIAware();
         let controls = INITCOMMONCONTROLSEX {
@@ -779,13 +886,14 @@ pub fn run() -> Result<(), String> {
         };
         InitCommonControlsEx(&controls);
         let instance = GetModuleHandleW(null());
+        let icon = crate::tray::Icon::new()?;
         let class = wide(window_class);
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = instance;
         wc.lpszClassName = class.as_ptr();
         wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
-        wc.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+        wc.hIcon = icon.0;
         wc.hbrBackground = (COLOR_BTNFACE + 1) as usize as _;
         if RegisterClassW(&wc) == 0 {
             return Err(last_error("注册窗口"));
@@ -816,14 +924,17 @@ pub fn run() -> Result<(), String> {
             scale,
             safe,
             theme: None,
+            icon,
+            #[cfg(test)]
+            test_tray: None,
         }));
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
             wide(if safe {
-                "Replay Guardian（只读测试）"
+                "Replay Guardian 0.1.2（只读测试）"
             } else {
-                "Replay Guardian"
+                "Replay Guardian 0.1.2"
             })
             .as_ptr(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
@@ -850,7 +961,7 @@ pub fn run() -> Result<(), String> {
         // Consume a launcher's hidden first-show instruction before later tray opens.
         ShowWindow(hwnd, SW_HIDE);
         if !args.iter().any(|a| a == "--background") || !app.borrow().tray_added {
-            ShowWindow(hwnd, SW_SHOW);
+            app.borrow_mut().show_settings(hwnd);
         }
         if let Some(warning) = warning {
             MessageBoxW(
@@ -869,7 +980,9 @@ pub fn run() -> Result<(), String> {
             if result < 0 {
                 return Err(last_error("窗口消息读取"));
             }
-            if IsDialogMessageW(hwnd, &msg) == 0 {
+            if !(WM_KEYFIRST..=WM_KEYLAST).contains(&msg.message)
+                || IsDialogMessageW(hwnd, &msg) == 0
+            {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -907,12 +1020,14 @@ mod tests {
                 scale: 1.0,
                 safe: true,
                 theme: None,
+                icon: crate::tray::Icon::new().unwrap(),
+                test_tray: Some(false),
             }));
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
                 wide("Replay Guardian test").as_ptr(),
-                WS_OVERLAPPED,
+                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                 0,
                 0,
                 530,
@@ -923,15 +1038,51 @@ mod tests {
                 (&mut *app as *mut RefCell<App>).cast(),
             );
             assert!(!hwnd.is_null());
-            app.borrow_mut().build(hwnd);
+            // Activation must survive re-entry while the app is borrowed and
+            // create controls lazily for an initially background-only window.
+            {
+                let _borrow = app.borrow_mut();
+                SendMessageW(hwnd, WM_COMMAND, SETTINGS as usize, 0);
+            }
+            let mut pending: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut pending, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&pending);
+                DispatchMessageW(&pending);
+            }
+            assert_ne!(IsWindowVisible(hwnd), 0);
             assert!(GetWindowTextLengthW(hwnd) > 0);
             assert_eq!(
                 SendMessageW(app.borrow().controls[&MODE], CB_GETCOUNT, 0, 0),
                 4
             );
-            SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            SendMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE as usize, 0);
             assert_ne!(IsWindow(hwnd), 0);
+            assert_ne!(
+                IsWindowVisible(hwnd),
+                0,
+                "Tray failure must leave a usable window"
+            );
+            assert!(app.borrow().controls.contains_key(&EXIT));
+            app.borrow_mut().test_tray = Some(true);
+            SendMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE as usize, 0);
+            assert_ne!(
+                IsWindow(hwnd),
+                0,
+                "Title-bar close must not destroy the hidden settings window"
+            );
             assert_eq!(IsWindowVisible(hwnd), 0);
+            ShowWindow(hwnd, SW_MINIMIZE);
+            PostMessageW(hwnd, WM_COMMAND, SETTINGS as usize, 0);
+            while PeekMessageW(&mut pending, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&pending);
+                DispatchMessageW(&pending);
+            }
+            assert_eq!(
+                IsIconic(hwnd),
+                0,
+                "Second launch must restore a minimized window"
+            );
+            assert_ne!(IsWindowVisible(hwnd), 0);
             PostMessageW(hwnd, WM_COMMAND, EXIT as usize, 0);
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
