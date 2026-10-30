@@ -5,6 +5,7 @@ mod detector;
 mod monitor;
 mod recovery;
 mod ui;
+mod ui_style;
 mod win;
 
 fn main() {

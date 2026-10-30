@@ -195,16 +195,24 @@ fn run(
                     let mut messages = Vec::new();
                     match Mcp::connect() {
                         Ok(mut c) => messages.push(format!(
-                            "MCP：{:?}；明确开启工具：{}",
-                            c.status(),
-                            c.can_enable
+                            "MCP：{}；恢复接口{}",
+                            c.status()
+                                .map(|state| state.label().to_string())
+                                .unwrap_or_else(|error| error),
+                            if c.can_enable { "可用" } else { "不可用" }
                         )),
                         Err(e) => messages.push(format!("MCP：{e}")),
                     };
                     messages.push(format!(
-                        "注册表原始读取：{:?}；已校验：{}",
-                        registry::read(),
-                        trusted(&config)
+                        "注册表：{}；{}",
+                        registry::read()
+                            .map(|state| state.label().to_string())
+                            .unwrap_or_else(|error| error),
+                        if trusted(&config) {
+                            "本机校验已完成"
+                        } else {
+                            "尚未完成本机校验"
+                        }
                     ));
                     messages.push(format!(
                         "事件监听：{}",

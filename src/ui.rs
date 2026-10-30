@@ -44,6 +44,7 @@ struct App {
     tray_added: bool,
     scale: f64,
     safe: bool,
+    theme: Option<crate::ui_style::Theme>,
 }
 // This small wrapper mirrors CreateWindowEx's native control geometry.
 #[allow(clippy::too_many_arguments)]
@@ -94,140 +95,219 @@ unsafe fn selected(hwnd: HWND) -> usize {
 }
 impl App {
     unsafe fn build(&mut self, hwnd: HWND) {
-        let s = self.scale;
-        control(hwnd, "STATIC", "Replay Guardian", 0, 20, 16, 480, 25, 0, s);
-        self.controls.insert(
-            STATUS,
-            control(
-                hwnd,
-                "STATIC",
-                "状态未知 · 正在连接",
-                STATUS,
-                20,
-                48,
-                480,
-                25,
-                0,
-                s,
-            ),
-        );
-        self.controls.insert(
-            DETAIL,
-            control(hwnd, "STATIC", "", DETAIL, 20, 78, 480, 82, 0, s),
-        );
-        for (label, y) in [
-            ("检测方式", 170),
-            ("检测间隔", 208),
-            ("重试基础间隔", 246),
-            ("即时回放快捷键", 412),
-        ] {
-            control(hwnd, "STATIC", label, 0, 20, y + 4, 150, 24, 0, s);
-        }
-        for (id, y, entries, index) in [
-            (
-                MODE,
-                170,
-                vec!["自动选择", "NVIDIA MCP", "注册表轮询", "注册表事件监听"],
-                match self.config.mode {
-                    Mode::Auto => 0,
-                    Mode::Mcp => 1,
-                    Mode::Poll => 2,
-                    Mode::Event => 3,
-                },
-            ),
-            (
-                INTERVAL,
-                208,
-                vec!["5 秒", "10 秒", "30 秒", "60 秒"],
-                [5, 10, 30, 60]
-                    .iter()
-                    .position(|v| *v == self.config.interval)
-                    .unwrap_or(1),
-            ),
-            (
-                RETRY,
-                246,
-                vec!["30 秒", "60 秒", "120 秒", "300 秒"],
-                [30, 60, 120, 300]
-                    .iter()
-                    .position(|v| *v == self.config.retry)
-                    .unwrap_or(0),
-            ),
-        ] {
-            let c = control(
-                hwnd,
-                "COMBOBOX",
-                "",
-                id,
-                180,
-                y,
-                300,
-                200,
-                CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
-                s,
-            );
-            for entry in entries {
-                SendMessageW(c, CB_ADDSTRING, 0, wide(entry).as_ptr() as isize);
+        let scale = self.scale;
+        self.theme = Some(crate::ui_style::Theme::new(scale));
+        let theme = self.theme.as_ref().unwrap();
+        let state = self.snapshot.state;
+        let paused = self.paused;
+        let mut controls = BTreeMap::new();
+        let mut put = |id: u16,
+                       class: &str,
+                       text: &str,
+                       x: i32,
+                       y: i32,
+                       w: i32,
+                       h: i32,
+                       style: u32,
+                       font: HFONT| {
+            let c = control(hwnd, class, text, id, x, y, w, h, style, scale);
+            theme.assign_control(c, id, y, state, paused);
+            SendMessageW(c, WM_SETFONT, font as usize, 1);
+            if class == "BUTTON" {
+                SetWindowTheme(c, wide("Explorer").as_ptr(), null());
             }
-            SendMessageW(c, CB_SETCURSEL, index, 0);
-            self.controls.insert(id, c);
+            if id != 0 {
+                controls.insert(id, c);
+            }
+            c
+        };
+        put(
+            0,
+            "STATIC",
+            "Replay Guardian",
+            28,
+            18,
+            460,
+            34,
+            0,
+            theme.title,
+        );
+        put(
+            119,
+            "STATIC",
+            "即时回放监控与自动恢复",
+            29,
+            55,
+            500,
+            20,
+            0,
+            theme.small,
+        );
+        put(
+            STATUS,
+            "STATIC",
+            "正在读取回放状态",
+            72,
+            96,
+            365,
+            29,
+            0,
+            theme.status,
+        );
+        put(
+            118,
+            "STATIC",
+            "等待检测方式就绪",
+            72,
+            128,
+            365,
+            20,
+            0,
+            theme.small,
+        );
+        put(
+            PAUSE,
+            "BUTTON",
+            "暂停监控",
+            464,
+            102,
+            124,
+            34,
+            WS_TABSTOP,
+            theme.body,
+        );
+        for (title, y) in [("检测设置", 184), ("自动恢复", 314), ("常规选项", 442)] {
+            put(0, "STATIC", title, 44, y, 400, 24, 0, theme.section);
         }
-        for (id, label, y, value) in [
-            (RESTORE, "自动恢复即时回放", 290, self.config.restore),
-            (STARTUP, "当前用户登录时启动", 324, self.config.startup),
-            (
-                NOTIFY,
-                "确认恢复成功后显示系统通知（默认关闭）",
-                358,
-                self.config.notify,
-            ),
-        ] {
-            let c = control(
-                hwnd,
-                "BUTTON",
-                label,
-                id,
-                20,
-                y,
-                470,
-                28,
-                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-                s,
-            );
-            checkbox(c, value);
-            self.controls.insert(id, c);
-        }
-        for (id, label, x, value) in [
-            (ALT, "Alt", 180, self.config.alt),
-            (SHIFT, "Shift", 250, self.config.shift),
-            (CTRL, "Ctrl", 330, self.config.ctrl),
-        ] {
-            let c = control(
-                hwnd,
-                "BUTTON",
-                label,
-                id,
-                x,
-                412,
-                75,
-                28,
-                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-                s,
-            );
-            checkbox(c, value);
-            self.controls.insert(id, c);
-        }
-        let c = control(
-            hwnd,
+        put(0, "STATIC", "检测方式", 44, 219, 100, 24, 0, theme.body);
+        let c = put(
+            MODE,
             "COMBOBOX",
             "",
-            KEY,
-            410,
-            412,
-            70,
+            170,
+            214,
+            422,
             200,
             CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
-            s,
+            theme.body,
+        );
+        for label in [
+            "自动选择（推荐）",
+            "NVIDIA MCP",
+            "注册表轮询",
+            "注册表事件监听",
+        ] {
+            SendMessageW(c, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+        }
+        SendMessageW(
+            c,
+            CB_SETCURSEL,
+            match self.config.mode {
+                Mode::Auto => 0,
+                Mode::Mcp => 1,
+                Mode::Poll => 2,
+                Mode::Event => 3,
+            },
+            0,
+        );
+
+        for (id, x, values, current) in [
+            (INTERVAL, 170, vec![5, 10, 30, 60], self.config.interval),
+            (RETRY, 462, vec![30, 60, 120, 300], self.config.retry),
+        ] {
+            put(
+                0,
+                "STATIC",
+                if id == INTERVAL {
+                    "检测间隔"
+                } else {
+                    "重试间隔"
+                },
+                if id == INTERVAL { 44 } else { 348 },
+                258,
+                105,
+                24,
+                0,
+                theme.body,
+            );
+            let c = put(
+                id,
+                "COMBOBOX",
+                "",
+                x,
+                253,
+                130,
+                200,
+                CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
+                theme.body,
+            );
+            for value in &values {
+                SendMessageW(
+                    c,
+                    CB_ADDSTRING,
+                    0,
+                    wide(&format!("{value} 秒")).as_ptr() as isize,
+                );
+            }
+            SendMessageW(
+                c,
+                CB_SETCURSEL,
+                values.iter().position(|v| *v == current).unwrap_or(0),
+                0,
+            );
+        }
+        let c = put(
+            RESTORE,
+            "BUTTON",
+            "自动恢复即时回放",
+            44,
+            340,
+            232,
+            28,
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            theme.body,
+        );
+        checkbox(c, self.config.restore);
+        put(
+            119,
+            "STATIC",
+            "需要关闭回放时，请先暂停监控",
+            293,
+            346,
+            300,
+            20,
+            0,
+            theme.small,
+        );
+        put(0, "STATIC", "备用快捷键", 44, 387, 115, 24, 0, theme.body);
+        for (id, label, x, value) in [
+            (ALT, "Alt", 170, self.config.alt),
+            (SHIFT, "Shift", 246, self.config.shift),
+            (CTRL, "Ctrl", 338, self.config.ctrl),
+        ] {
+            let c = put(
+                id,
+                "BUTTON",
+                label,
+                x,
+                380,
+                80,
+                30,
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                theme.body,
+            );
+            checkbox(c, value);
+        }
+        let c = put(
+            KEY,
+            "COMBOBOX",
+            "",
+            480,
+            380,
+            112,
+            200,
+            CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
+            theme.body,
         );
         let keys = config::key_options();
         for (_, label) in &keys {
@@ -241,44 +321,75 @@ impl App {
                 .unwrap_or(9),
             0,
         );
-        self.controls.insert(KEY, c);
-        control(
-            hwnd,
+        for (id, label, x, w, value) in [
+            (STARTUP, "登录 Windows 时启动", 44, 250, self.config.startup),
+            (NOTIFY, "恢复成功时通知", 320, 272, self.config.notify),
+        ] {
+            let c = put(
+                id,
+                "BUTTON",
+                label,
+                x,
+                470,
+                w,
+                28,
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                theme.body,
+            );
+            checkbox(c, value);
+        }
+        put(
+            119,
             "STATIC",
-            "保持回放关闭时请先暂停监控。快捷键须与 NVIDIA 设置一致。",
-            0,
+            "通知默认关闭，仅在主动恢复并确认开启后显示",
+            44,
+            505,
+            548,
             20,
-            455,
-            480,
-            36,
             0,
-            s,
+            theme.small,
         );
         for (id, label, x, w) in [
-            (TEST, "测试检测方式", 20, 145),
-            (CALIBRATE, "校验注册表…", 180, 155),
-            (CANCEL, "取消校验", 350, 130),
+            (TEST, "测试检测方式", 28, 150),
+            (CALIBRATE, "校验注册表…", 190, 160),
+            (CANCEL, "取消校验", 362, 116),
         ] {
-            let c = control(hwnd, "BUTTON", label, id, x, 500, w, 30, WS_TABSTOP, s);
-            self.controls.insert(id, c);
+            put(id, "BUTTON", label, x, 548, w, 32, WS_TABSTOP, theme.body);
         }
-        control(
-            hwnd,
-            "STATIC",
-            "设置修改后自动保存；关闭此窗口后仍在托盘运行。",
-            0,
-            20,
-            548,
-            480,
-            26,
-            0,
-            s,
+        put(
+            DETAIL,
+            "EDIT",
+            "监控诊断信息将在这里显示",
+            28,
+            592,
+            584,
+            64,
+            ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | WS_VSCROLL,
+            theme.small,
         );
+        put(
+            119,
+            "STATIC",
+            "设置自动保存 · 关闭窗口后继续在托盘运行",
+            28,
+            674,
+            584,
+            20,
+            0,
+            theme.small,
+        );
+        self.controls = controls;
+        SendMessageW(
+            self.controls[&DETAIL],
+            EM_SETMARGINS,
+            (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
+            ((8.0 * scale) as usize | (((8.0 * scale) as usize) << 16)) as isize,
+        );
+        EnableWindow(self.controls[&CANCEL], 0);
         if self.safe {
-            EnableWindow(self.controls[&RESTORE], 0);
-            EnableWindow(self.controls[&STARTUP], 0);
-            EnableWindow(self.controls[&CALIBRATE], 0);
-            EnableWindow(self.controls[&CANCEL], 0);
+            for id in [RESTORE, STARTUP, CALIBRATE, CANCEL] {
+                EnableWindow(self.controls[&id], 0);
+            }
         }
     }
     unsafe fn update(&mut self, hwnd: HWND) {
@@ -293,17 +404,50 @@ impl App {
                 self.snapshot = snapshot;
             }
         }
-        let text = format!(
-            "{} · {}{}",
-            self.snapshot.state.label(),
-            self.snapshot.actual.label(),
-            if self.paused { " · 已暂停" } else { "" }
-        );
+        let text = if self.paused {
+            "监控已暂停".into()
+        } else if self.snapshot.state == crate::detector::State::Unknown {
+            "回放状态未知".into()
+        } else {
+            format!(
+                "即时回放{}",
+                self.snapshot.state.label().trim_start_matches("状态")
+            )
+        };
         if self.controls.is_empty() {
             self.tray(hwnd, false);
             return;
         }
+        if let Some(theme) = &self.theme {
+            for id in [STATUS, 118] {
+                theme.assign_control(
+                    self.controls[&id],
+                    id,
+                    100,
+                    self.snapshot.state,
+                    self.paused,
+                );
+            }
+        }
         SetWindowTextW(self.controls[&STATUS], wide(&text).as_ptr());
+        SetWindowTextW(
+            self.controls[&118],
+            wide(&format!(
+                "当前检测：{}{}",
+                self.snapshot.actual.label(),
+                if self.safe { " · 只读测试" } else { "" }
+            ))
+            .as_ptr(),
+        );
+        SetWindowTextW(
+            self.controls[&PAUSE],
+            wide(if self.paused {
+                "恢复监控"
+            } else {
+                "暂停监控"
+            })
+            .as_ptr(),
+        );
         SetWindowTextW(self.controls[&DETAIL], wide(&self.snapshot.detail).as_ptr());
         let label = match self.snapshot.calibration {
             1 => "记录：已开启",
@@ -312,6 +456,11 @@ impl App {
             _ => "校验注册表…",
         };
         SetWindowTextW(self.controls[&CALIBRATE], wide(label).as_ptr());
+        EnableWindow(
+            self.controls[&CANCEL],
+            i32::from(self.snapshot.calibration > 0 && !self.safe),
+        );
+        InvalidateRect(hwnd, null(), 0);
         self.tray(hwnd, false);
     }
     unsafe fn tray(&mut self, hwnd: HWND, add: bool) {
@@ -456,6 +605,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
         DestroyWindow(hwnd);
         return 0;
     }
+    if matches!(
+        message,
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT
+    ) && let Some(color) = crate::ui_style::control_color(l as HWND, w as HDC)
+    {
+        return color;
+    }
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<App>;
     if ptr.is_null() {
         return DefWindowProcW(hwnd, message, w, l);
@@ -468,6 +624,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
         return 0;
     }
     match message {
+        WM_PAINT if app.theme.is_some() => {
+            app.theme
+                .as_ref()
+                .unwrap()
+                .paint(hwnd, app.scale, app.snapshot.state, app.paused);
+            0
+        }
+        WM_ERASEBKGND if app.theme.is_some() => 1,
         WM_CLOSE => {
             ShowWindow(hwnd, SW_HIDE);
             0
@@ -580,17 +744,28 @@ pub fn run() -> Result<(), String> {
         std::fs::write(path, report).map_err(|e| e.to_string())?;
         return Ok(());
     }
+    let preview = args.iter().any(|arg| arg == "--preview");
     unsafe {
+        let window_class = if preview {
+            "ReplayGuardianPreviewWindow"
+        } else {
+            "ReplayGuardianWindow"
+        };
         let mutex = Handle(CreateMutexW(
             null(),
             0,
-            wide("Local\\ReplayGuardian.Monitor.v1").as_ptr(),
+            wide(if preview {
+                "Local\\ReplayGuardian.Preview.v1"
+            } else {
+                "Local\\ReplayGuardian.Monitor.v1"
+            })
+            .as_ptr(),
         ));
         if mutex.0.is_null() {
             return Err(last_error("单实例检查"));
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let hwnd = FindWindowW(wide("ReplayGuardianWindow").as_ptr(), null());
+            let hwnd = FindWindowW(wide(window_class).as_ptr(), null());
             if !hwnd.is_null() {
                 PostMessageW(hwnd, WM_COMMAND, SETTINGS as usize, 0);
                 SetForegroundWindow(hwnd);
@@ -598,8 +773,13 @@ pub fn run() -> Result<(), String> {
             return Ok(());
         }
         SetProcessDPIAware();
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_STANDARD_CLASSES,
+        };
+        InitCommonControlsEx(&controls);
         let instance = GetModuleHandleW(null());
-        let class = wide("ReplayGuardianWindow");
+        let class = wide(window_class);
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = instance;
@@ -611,7 +791,7 @@ pub fn run() -> Result<(), String> {
             return Err(last_error("注册窗口"));
         }
         let (mut config, warning) = Config::load();
-        let safe = args.iter().any(|a| a == "--safe");
+        let safe = preview || args.iter().any(|a| a == "--safe");
         if safe {
             config.restore = false;
             config.startup = false;
@@ -635,6 +815,7 @@ pub fn run() -> Result<(), String> {
             tray_added: false,
             scale,
             safe,
+            theme: None,
         }));
         let hwnd = CreateWindowExW(
             0,
@@ -645,11 +826,11 @@ pub fn run() -> Result<(), String> {
                 "Replay Guardian"
             })
             .as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            (530.0 * scale) as i32,
-            (630.0 * scale) as i32,
+            ((crate::ui_style::CLIENT_WIDTH + 16) as f64 * scale) as i32,
+            ((crate::ui_style::CLIENT_HEIGHT + 39) as f64 * scale) as i32,
             null_mut(),
             null_mut(),
             instance,
@@ -725,6 +906,7 @@ mod tests {
                 tray_added: false,
                 scale: 1.0,
                 safe: true,
+                theme: None,
             }));
             let hwnd = CreateWindowExW(
                 0,
