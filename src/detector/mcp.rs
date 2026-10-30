@@ -1,3 +1,4 @@
+use super::rate_limit::{self, Gate};
 use crate::{
     detector::{State, parse_status},
     win::{last_error, wide},
@@ -8,10 +9,33 @@ use std::{
     ffi::c_void,
     io::{BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 use windows_sys::Win32::Networking::WinHttp::*;
+static CALL_GATE: OnceLock<Mutex<Gate>> = OnceLock::new();
+fn gate() -> std::sync::MutexGuard<'static, Gate> {
+    CALL_GATE
+        .get_or_init(|| Mutex::new(Gate::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+pub fn cooldown_remaining() -> Option<Duration> {
+    gate().remaining(Instant::now())
+}
+pub fn tool_gap() -> Duration {
+    gate().tool_gap()
+}
+pub fn is_rate_limited(error: &str) -> bool {
+    error.starts_with(rate_limit::MESSAGE)
+}
+pub fn cooldown_message() -> String {
+    rate_limit::message(cooldown_remaining().unwrap_or(Duration::from_secs(1)))
+}
 struct Internet(*mut c_void);
 impl Drop for Internet {
     fn drop(&mut self) {
@@ -50,6 +74,7 @@ pub struct Mcp {
     session: Option<String>,
     id: u64,
     pub can_enable: bool,
+    cancellation: Option<(Arc<crate::win::Handle>, Arc<AtomicU64>, u64)>,
 }
 
 fn endpoint() -> Result<(u16, String), String> {
@@ -212,6 +237,15 @@ impl Http {
             if status == 401 || status == 403 {
                 return Err(format!("MCP 权限受限 HTTP {status}，不会改用快捷键绕过"));
             }
+            if status == 429 {
+                let seconds = header(request.0, "Retry-After")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(30);
+                return Ok((
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32029,"data":{"retryAfter":seconds},"message":"HTTP 429"}}),
+                    None,
+                ));
+            }
             if status == 202 && id.is_none() {
                 return Ok((Value::Null, header(request.0, "Mcp-Session-Id")));
             }
@@ -352,10 +386,13 @@ impl Bridge {
 }
 impl Mcp {
     pub fn connect() -> Result<Self, String> {
+        if cooldown_remaining().is_some() {
+            return Err(cooldown_message());
+        }
         let http = Http::new().and_then(|http| Self::start(Transport::Http(http)));
         match http {
             Ok(c) => Ok(c),
-            Err(e) if e.contains("权限") => Err(e),
+            Err(e) if e.contains("权限") || is_rate_limited(&e) => Err(e),
             Err(http_error) => Self::start(Transport::Bridge(Bridge::new()?))
                 .map_err(|e| format!("HTTP: {http_error}；桥接: {e}")),
         }
@@ -367,6 +404,7 @@ impl Mcp {
             session: None,
             id: 0,
             can_enable: false,
+            cancellation: None,
         };
         let discovery = c.rpc("server/discover", json!({}));
         let modern = discovery.as_ref().is_ok_and(|v| {
@@ -375,7 +413,10 @@ impl Mcp {
                 .is_some_and(|a| a.iter().any(|v| v == "2026-07-28"))
         });
         if !modern {
-            if discovery.as_ref().is_err_and(|e| e.contains("权限")) {
+            if discovery
+                .as_ref()
+                .is_err_and(|e| e.contains("权限") || is_rate_limited(e))
+            {
                 return Err(discovery.err().unwrap());
             }
             c.legacy = true;
@@ -405,6 +446,7 @@ impl Mcp {
         Ok(c)
     }
     fn rpc(&mut self, method: &str, mut params: Value) -> Result<Value, String> {
+        self.wait_for_slot(method == "tools/call")?;
         self.id += 1;
         if !self.legacy {
             params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ReplayGuardian","version":"0.1.0"},"io.modelcontextprotocol/clientCapabilities":{}});
@@ -420,10 +462,62 @@ impl Mcp {
             }
             Transport::Bridge(b) => b.request(&body)?,
         };
+        if let Some(delay) = rate_limit::retry_after(&value) {
+            gate().block(Instant::now(), delay);
+            return Err(cooldown_message());
+        }
         if value.get("error").is_some() {
             return Err(format!("MCP 协议拒绝：{}", value["error"]));
         }
         Ok(value)
+    }
+    pub fn set_cancellation(
+        &mut self,
+        event: Arc<crate::win::Handle>,
+        epoch: Arc<AtomicU64>,
+        generation: u64,
+    ) {
+        self.cancellation = Some((event, epoch, generation));
+    }
+    fn wait_for_slot(&self, tool: bool) -> Result<(), String> {
+        loop {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(|(_, epoch, generation)| epoch.load(Ordering::SeqCst) != *generation)
+            {
+                return Err("MCP 请求已因暂停或设置更改取消".into());
+            }
+            let wait = gate().acquire(Instant::now(), tool);
+            match wait {
+                Ok(()) => return Ok(()),
+                Err(delay) => {
+                    if let Some((event, _, _)) = &self.cancellation {
+                        let millis = (delay.as_millis() + 1).min(u32::MAX as u128 - 1) as u32;
+                        let result = unsafe {
+                            windows_sys::Win32::System::Threading::WaitForSingleObject(
+                                event.0, millis,
+                            )
+                        };
+                        if result == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                            && self
+                                .cancellation
+                                .as_ref()
+                                .is_some_and(|(_, epoch, generation)| {
+                                    epoch.load(Ordering::SeqCst) == *generation
+                                })
+                        {
+                            continue;
+                        }
+                        if result != windows_sys::Win32::Foundation::WAIT_TIMEOUT {
+                            return Err("MCP 请求等待已取消".into());
+                        }
+                    } else {
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        }
     }
     fn notification(&mut self, method: &str) -> Result<(), String> {
         let body = json!({"jsonrpc":"2.0","method":method});
@@ -467,6 +561,28 @@ impl Mcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_request_does_not_take_a_network_slot() {
+        let event = Arc::new(crate::win::Handle(unsafe {
+            windows_sys::Win32::System::Threading::CreateEventW(
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+            )
+        }));
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mut client = Mcp {
+            transport: Transport::Http(Http::at(9, "/mcp".into()).unwrap()),
+            legacy: false,
+            session: None,
+            id: 0,
+            can_enable: false,
+            cancellation: None,
+        };
+        client.set_cancellation(event, epoch, 0);
+        assert!(client.wait_for_slot(true).unwrap_err().contains("取消"));
+    }
     #[test]
     fn native_http_reads_split_sse_and_sends_modern_metadata() {
         use std::net::TcpListener;
@@ -516,6 +632,7 @@ mod tests {
             session: None,
             id: 0,
             can_enable: false,
+            cancellation: None,
         };
         assert_eq!(client.status().unwrap(), State::Off);
         server.join().unwrap();

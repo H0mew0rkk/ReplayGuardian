@@ -2,7 +2,7 @@ use crate::{
     config::{Config, Mode, log_error},
     detector::{
         State,
-        mcp::Mcp,
+        mcp::{self, Mcp},
         registry::{self, Watch},
     },
     recovery::{Decision, Guard},
@@ -193,16 +193,26 @@ fn run(
                 Command::Test => {
                     guard.cancel(clock.elapsed().as_secs());
                     let mut messages = Vec::new();
-                    match Mcp::connect() {
-                        Ok(mut c) => messages.push(format!(
+                    if mcp.is_none() {
+                        match Mcp::connect() {
+                            Ok(c) => mcp = Some(c),
+                            Err(e) => messages.push(format!("MCP：{e}")),
+                        }
+                    }
+                    if let Some(c) = mcp.as_mut() {
+                        c.set_cancellation(
+                            event.clone(),
+                            epoch.clone(),
+                            epoch.load(Ordering::SeqCst),
+                        );
+                        messages.push(format!(
                             "MCP：{}；恢复接口{}",
                             c.status()
                                 .map(|state| state.label().to_string())
                                 .unwrap_or_else(|error| error),
                             if c.can_enable { "可用" } else { "不可用" }
-                        )),
-                        Err(e) => messages.push(format!("MCP：{e}")),
-                    };
+                        ));
+                    }
                     messages.push(format!(
                         "注册表：{}；{}",
                         registry::read()
@@ -239,6 +249,13 @@ fn run(
                         calibration = 1;
                     }
                     let raw = registry::read();
+                    if let Some(c) = mcp.as_mut() {
+                        c.set_cancellation(
+                            event.clone(),
+                            epoch.clone(),
+                            epoch.load(Ordering::SeqCst),
+                        );
+                    }
                     let agreement = mcp
                         .as_mut()
                         .and_then(|c| c.status().ok())
@@ -319,7 +336,6 @@ fn run(
             }
         }
         let generation = epoch.load(Ordering::SeqCst);
-        let now = clock.elapsed().as_secs();
         snapshot.recovered = false;
         let desired = if config.mode == Mode::Auto {
             if mcp.is_none() && Instant::now() >= reconnect && Instant::now() >= upgrade {
@@ -328,6 +344,15 @@ fn run(
                         recovery_restricted = !c.can_enable;
                         mcp = Some(c);
                         failures = 0;
+                    }
+                    Err(e) if mcp::is_rate_limited(&e) => {
+                        snapshot.state = State::Unknown;
+                        snapshot.detail = e;
+                        snapshot.recovered = false;
+                        publish(hwnd, &out, &snapshot);
+                        next = Instant::now()
+                            + mcp::cooldown_remaining().unwrap_or(Duration::from_secs(5));
+                        continue;
                     }
                     Err(e) => {
                         recovery_restricted |= restricted(&e);
@@ -363,6 +388,15 @@ fn run(
                     recovery_restricted = !c.can_enable;
                     mcp = Some(c);
                 }
+                Err(e) if mcp::is_rate_limited(&e) => {
+                    snapshot.state = State::Unknown;
+                    snapshot.detail = e;
+                    snapshot.recovered = false;
+                    publish(hwnd, &out, &snapshot);
+                    next = Instant::now()
+                        + mcp::cooldown_remaining().unwrap_or(Duration::from_secs(5));
+                    continue;
+                }
                 Err(e) => {
                     recovery_restricted |= restricted(&e);
                     snapshot.detail = e;
@@ -378,11 +412,18 @@ fn run(
                 }
             }
         }
+        if let Some(c) = mcp.as_mut() {
+            c.set_cancellation(event.clone(), epoch.clone(), generation);
+        }
         let result = if desired == Mode::Event && watch.is_none() {
             Err("事件监听不可用，等待重新订阅".into())
         } else {
             read(desired, &mut mcp, &config)
         };
+        if epoch.load(Ordering::SeqCst) != generation {
+            continue;
+        }
+        let now = clock.elapsed().as_secs();
         snapshot.state = match result {
             Ok(state) => {
                 failures = 0;
@@ -393,6 +434,18 @@ fn run(
                 }
                 .into();
                 state
+            }
+            Err(e) if mcp::is_rate_limited(&e) => {
+                failures = 0;
+                guard.extend_confirmation(
+                    now,
+                    mcp::cooldown_remaining()
+                        .unwrap_or(Duration::from_secs(5))
+                        .as_secs()
+                        + 1,
+                );
+                snapshot.detail = e;
+                State::Unknown
             }
             Err(e) => {
                 recovery_restricted |= restricted(&e);
@@ -435,17 +488,37 @@ fn run(
             }
             Decision::Restore => {
                 // A final read narrows, but cannot eliminate, the hotkey toggle race.
-                if read(desired, &mut mcp, &config) == Ok(State::Off)
+                if (desired == Mode::Mcp || read(desired, &mut mcp, &config) == Ok(State::Off))
                     && epoch.load(Ordering::SeqCst) == generation
                 {
                     let recovery = if let Some(c) = mcp.as_mut() {
                         if !c.can_enable {
                             Err("MCP 无明确开启权限；不使用快捷键绕过".into())
                         } else {
-                            match c.status() {
+                            let state = if desired == Mode::Mcp {
+                                Ok(snapshot.state)
+                            } else {
+                                c.status()
+                            };
+                            match state {
                                 Ok(State::Off) if epoch.load(Ordering::SeqCst) == generation => {
                                     guard.attempted(clock.elapsed().as_secs());
-                                    c.enable()
+                                    let result = c.enable();
+                                    if result.as_ref().is_err_and(|e| mcp::is_rate_limited(e)) {
+                                        guard.defer(
+                                            clock.elapsed().as_secs(),
+                                            mcp::cooldown_remaining()
+                                                .unwrap_or(Duration::from_secs(5))
+                                                .as_secs()
+                                                + 1,
+                                        );
+                                    } else {
+                                        guard.paced_attempt(
+                                            clock.elapsed().as_secs(),
+                                            mcp::tool_gap().as_secs() + 1,
+                                        );
+                                    }
+                                    result
                                 }
                                 _ => Err("官方状态不再明确为关闭，已取消恢复".into()),
                             }
@@ -460,7 +533,7 @@ fn run(
                         recovery_restricted |= restricted(e);
                         snapshot.detail = e.clone();
                         log_error(e);
-                        if !guard.pending() {
+                        if !guard.pending() && !mcp::is_rate_limited(e) {
                             guard.rejected(now);
                         }
                     } else {

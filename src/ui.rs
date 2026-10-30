@@ -932,9 +932,9 @@ pub fn run() -> Result<(), String> {
             0,
             class.as_ptr(),
             wide(if safe {
-                "Replay Guardian 0.1.2（只读测试）"
+                "Replay Guardian 0.1.3（只读测试）"
             } else {
-                "Replay Guardian 0.1.2"
+                "Replay Guardian 0.1.3"
             })
             .as_ptr(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,

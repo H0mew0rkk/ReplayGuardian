@@ -1,4 +1,5 @@
 pub mod mcp;
+mod rate_limit;
 pub mod registry;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {

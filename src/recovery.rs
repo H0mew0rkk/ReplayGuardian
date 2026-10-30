@@ -12,6 +12,7 @@ pub struct Guard {
     pending: Option<u64>,
     next_attempt: u64,
     failures: u32,
+    verify_window: u64,
 }
 impl Guard {
     pub fn reset(&mut self) {
@@ -26,6 +27,11 @@ impl Guard {
     pub fn pending(&self) -> bool {
         self.pending.is_some()
     }
+    pub fn defer(&mut self, now: u64, seconds: u64) {
+        self.pending = None;
+        self.off_since = None;
+        self.next_attempt = self.next_attempt.max(now + seconds);
+    }
     pub fn failures(&self) -> u32 {
         self.failures
     }
@@ -35,11 +41,11 @@ impl Guard {
             return Decision::None;
         }
         if let Some(start) = self.pending {
-            if state == State::On && now <= start + 15 {
+            if state == State::On && now <= start + self.verify_window.max(15) {
                 self.reset();
                 return Decision::Recovered;
             }
-            if now < start + 15 {
+            if now < start + self.verify_window.max(15) {
                 return Decision::None;
             }
             self.pending = None;
@@ -71,6 +77,18 @@ impl Guard {
     pub fn attempted(&mut self, now: u64) {
         self.pending = Some(now);
         self.off_since = None;
+        self.verify_window = 15;
+    }
+    pub fn paced_attempt(&mut self, now: u64, wait: u64) {
+        self.attempted(now);
+        self.verify_window = wait + 15;
+    }
+    pub fn extend_confirmation(&mut self, now: u64, wait: u64) {
+        if let Some(start) = self.pending {
+            self.verify_window = self
+                .verify_window
+                .max(now.saturating_sub(start) + wait + 15);
+        }
     }
     pub fn rejected(&mut self, now: u64) {
         self.off_since = None;
@@ -146,6 +164,23 @@ fn input(key: u16, flags: u32) -> INPUT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refused_enable_is_not_a_recovery_attempt() {
+        let mut g = Guard::default();
+        g.attempted(0);
+        g.defer(1, 9);
+        assert_eq!(g.observe(2, State::On, true, 30), Decision::None);
+    }
+    #[test]
+    fn paced_verification_can_confirm_after_normal_window() {
+        let mut g = Guard::default();
+        g.paced_attempt(0, 30);
+        assert_eq!(g.observe(30, State::On, true, 30), Decision::Recovered);
+        let mut g = Guard::default();
+        g.attempted(0);
+        g.extend_confirmation(5, 25);
+        assert_eq!(g.observe(31, State::On, true, 30), Decision::Recovered);
+    }
     #[test]
     fn configuration_or_pause_cannot_erase_inflight_cooldown() {
         let mut g = Guard::default();
