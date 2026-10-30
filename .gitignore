@@ -2,10 +2,12 @@
 /target/
 /dist/
 
+# Project notes and validation records stay local
+/docs/
+
 # Local settings, diagnostics and fresh measurements
 /config.json
 /diagnostic*.txt
-/docs/validation/local/
 *.log
 *.dmp
 

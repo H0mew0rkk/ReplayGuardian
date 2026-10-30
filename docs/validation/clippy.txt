@@ -1,2 +1,0 @@
-    Checking replay-guardian v0.1.0 (<project>)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.51s
