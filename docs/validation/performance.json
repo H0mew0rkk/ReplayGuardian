@@ -1,0 +1,17 @@
+{
+  "Mode": "Auto, MCP active, --safe --background, settings never opened",
+  "ExeBytes": 479232,
+  "Sha256": "E5EECA07545CA8952CA363172DEED4B81261B2E8197E1A565F264AAEF11D2BED",
+  "Windows": "Microsoft Windows NT 10.0.26200.0",
+  "DurationSeconds": 600.503,
+  "CpuSeconds": 0.21875,
+  "CpuPercentOneCore": 0.036428,
+  "CpuPercentMachine": 0.003036,
+  "WorkingSetMinBytes": 15441920.0,
+  "WorkingSetMaxBytes": 16240640.0,
+  "PrivateBytesMax": 3092480.0,
+  "FirstHandles": 230,
+  "LastHandles": 235,
+  "FirstThreads": 10,
+  "LastThreads": 6
+}

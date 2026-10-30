@@ -1,0 +1,4 @@
+MCP state: Ok(On)
+Enable tool available: true
+Registry candidate: Ok(On)
+Registry fingerprint: <redacted>

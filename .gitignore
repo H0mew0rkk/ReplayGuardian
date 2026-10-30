@@ -1,0 +1,25 @@
+# Build outputs and local release archives
+/target/
+/dist/
+
+# Local settings, diagnostics and fresh measurements
+/config.json
+/diagnostic*.txt
+/docs/validation/local/
+*.log
+*.dmp
+
+# Credentials and machine-specific development settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+/.vscode/
+/.idea/
+/.codex/
+/.agents/
+Thumbs.db
+.DS_Store
