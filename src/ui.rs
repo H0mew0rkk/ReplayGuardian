@@ -35,6 +35,7 @@ const PAUSE: u16 = 115;
 const EXIT: u16 = 116;
 const SETTINGS: u16 = 117;
 const SHOW_SETTINGS: u32 = WM_APP + 4;
+const WINDOW_TITLE: &str = concat!("Replay Guardian ", env!("CARGO_PKG_VERSION"));
 struct App {
     config: Config,
     paused: bool,
@@ -899,9 +900,13 @@ pub fn run() -> Result<(), String> {
             0,
             class.as_ptr(),
             wide(if safe {
-                "Replay Guardian 0.1.3（只读测试）"
+                concat!(
+                    "Replay Guardian ",
+                    env!("CARGO_PKG_VERSION"),
+                    "（只读测试）"
+                )
             } else {
-                "Replay Guardian 0.1.3"
+                WINDOW_TITLE
             })
             .as_ptr(),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
@@ -993,7 +998,7 @@ mod tests {
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
-                wide("Replay Guardian test").as_ptr(),
+                wide(WINDOW_TITLE).as_ptr(),
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                 0,
                 0,
@@ -1017,7 +1022,12 @@ mod tests {
                 DispatchMessageW(&pending);
             }
             assert_ne!(IsWindowVisible(hwnd), 0);
-            assert!(GetWindowTextLengthW(hwnd) > 0);
+            let mut title = [0u16; 128];
+            let length = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+            assert_eq!(
+                String::from_utf16_lossy(&title[..length as usize]),
+                format!("Replay Guardian {}", env!("CARGO_PKG_VERSION"))
+            );
             assert_eq!(
                 SendMessageW(app.borrow().controls[&MODE], CB_GETCOUNT, 0, 0),
                 4

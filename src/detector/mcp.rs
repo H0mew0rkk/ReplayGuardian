@@ -138,7 +138,7 @@ impl Http {
     fn at(port: u16, path: String) -> Result<Self, String> {
         unsafe {
             let session = Internet(WinHttpOpen(
-                wide("ReplayGuardian/0.1").as_ptr(),
+                wide(concat!("ReplayGuardian/", env!("CARGO_PKG_VERSION"))).as_ptr(),
                 WINHTTP_ACCESS_TYPE_NO_PROXY,
                 std::ptr::null(),
                 std::ptr::null(),
@@ -420,7 +420,7 @@ impl Mcp {
                 return Err(discovery.err().unwrap());
             }
             c.legacy = true;
-            let init=c.rpc("initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ReplayGuardian","version":"0.1.0"}}))?;
+            let init=c.rpc("initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ReplayGuardian","version":env!("CARGO_PKG_VERSION")}}))?;
             if init["result"]["protocolVersion"] != "2025-11-25" {
                 return Err("MCP 不支持已实现的兼容协议".into());
             }
@@ -449,7 +449,7 @@ impl Mcp {
         self.wait_for_slot(method == "tools/call")?;
         self.id += 1;
         if !self.legacy {
-            params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ReplayGuardian","version":"0.1.0"},"io.modelcontextprotocol/clientCapabilities":{}});
+            params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ReplayGuardian","version":env!("CARGO_PKG_VERSION")},"io.modelcontextprotocol/clientCapabilities":{}});
         }
         let body = json!({"jsonrpc":"2.0","id":self.id,"method":method,"params":params});
         let value = match &mut self.transport {
@@ -618,6 +618,10 @@ mod tests {
             assert_eq!(
                 request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
                 "2026-07-28"
+            );
+            assert_eq!(
+                request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["version"],
+                env!("CARGO_PKG_VERSION")
             );
             let body=b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"structuredContent\":{\"instantReplayEnabled\":false}}}\r\n\r\n";
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
