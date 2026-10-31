@@ -137,17 +137,6 @@ impl App {
             theme.title,
         );
         put(
-            119,
-            "STATIC",
-            "即时回放监控与自动恢复",
-            29,
-            55,
-            500,
-            20,
-            0,
-            theme.small,
-        );
-        put(
             STATUS,
             "STATIC",
             "正在读取回放状态",
@@ -342,17 +331,6 @@ impl App {
             );
             checkbox(c, value);
         }
-        put(
-            119,
-            "STATIC",
-            "通知默认关闭，仅在主动恢复并确认开启后显示",
-            44,
-            505,
-            548,
-            20,
-            0,
-            theme.small,
-        );
         for (id, label, x, w) in [
             (TEST, "测试检测方式", 28, 150),
             (CALIBRATE, "校验注册表…", 190, 160),
@@ -370,17 +348,6 @@ impl App {
             584,
             64,
             ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | WS_VSCROLL,
-            theme.small,
-        );
-        put(
-            119,
-            "STATIC",
-            "设置自动保存 · 关闭窗口后继续在托盘运行",
-            28,
-            674,
-            584,
-            20,
-            0,
             theme.small,
         );
         self.controls = controls;

@@ -40,8 +40,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mode: Mode::Auto,
-            interval: 10,
-            retry: 30,
+            interval: 60,
+            retry: 120,
             restore: true,
             startup: false,
             notify: false,
@@ -132,22 +132,42 @@ pub fn directory() -> PathBuf {
         .join("ReplayGuardian")
 }
 pub fn log_error(message: &str) {
+    static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = directory();
     let _ = fs::create_dir_all(&dir);
-    let path = dir.join("errors.log");
-    if fs::metadata(&path)
-        .map(|m| m.len() > 65536)
-        .unwrap_or(false)
-        && (fs::copy(&path, dir.join("errors.previous.log")).is_err()
-            || fs::write(&path, []).is_err())
-    {
-        return;
+    let bounded: String = message.chars().take(2048).collect();
+    let entry = format!("{:?}: {}\n", std::time::SystemTime::now(), bounded);
+    let _ = append_log(&dir.join("errors.log"), entry.as_bytes());
+}
+
+const MAX_LOG_BYTES: u64 = 64 * 1024;
+const RETAIN_LOG_BYTES: usize = 32 * 1024;
+
+fn append_log(path: &std::path::Path, entry: &[u8]) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.seek(SeekFrom::End(0))?;
+    if len.saturating_add(entry.len() as u64) > MAX_LOG_BYTES {
+        let keep = len.min(RETAIN_LOG_BYTES.saturating_sub(entry.len()) as u64);
+        file.seek(SeekFrom::End(-(keep as i64)))?;
+        let mut tail = Vec::with_capacity(keep as usize);
+        file.read_to_end(&mut tail)?;
+        // The tail may start inside a UTF-8 character or a record. Skip that record.
+        let start = tail
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(tail.len(), |i| i + 1);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&tail[start..])?;
+        file.set_len((tail.len() - start) as u64)?;
     }
-    use std::io::Write;
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let bounded: String = message.chars().take(2048).collect();
-        let _ = writeln!(f, "{:?}: {}", std::time::SystemTime::now(), bounded);
-    }
+    file.write_all(entry)
 }
 pub fn set_startup(enable: bool) -> Result<(), String> {
     unsafe {
@@ -205,7 +225,8 @@ mod tests {
     fn defaults_safe_notifications_and_startup() {
         let c = Config::default();
         assert!(!c.notify && !c.startup);
-        assert_eq!(c.interval, 10);
+        assert_eq!(c.interval, 60);
+        assert_eq!(c.retry, 120);
         c.validate().unwrap();
     }
     #[test]
@@ -225,5 +246,47 @@ mod tests {
         let value = serde_json::to_vec(&c).unwrap();
         let restored: Config = serde_json::from_slice(&value).unwrap();
         assert_eq!(restored.mode, c.mode);
+    }
+
+    #[test]
+    fn log_keeps_recent_complete_utf8_lines_within_size_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "replay-guardian-log-test-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Filling the file exactly to the limit must preserve all existing data.
+        let original = format!("{}\n", "x".repeat(MAX_LOG_BYTES as usize - 3));
+        fs::write(&path, &original).unwrap();
+        append_log(&path, b"a\n").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_LOG_BYTES);
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{original}a\n"));
+
+        // Crossing the limit drops the oldest line but keeps the latest lines.
+        append_log(&path, "最新错误\n".as_bytes()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\n最新错误\n");
+
+        // An oversized legacy file is compacted without splitting Chinese text.
+        let old = "历史错误：自动恢复失败\n";
+        fs::write(&path, old.repeat(10000)).unwrap();
+        append_log(&path, "本次错误\n".as_bytes()).unwrap();
+        let recent = fs::read_to_string(&path).unwrap();
+        assert!(recent.len() <= RETAIN_LOG_BYTES);
+        assert!(recent.ends_with("本次错误\n"));
+        assert!(recent.lines().count() > 1);
+        assert!(
+            recent
+                .lines()
+                .all(|line| line == old.trim_end() || line == "本次错误")
+        );
+        append_log(&path, "继续写入\n".as_bytes()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{recent}继续写入\n")
+        );
+        fs::remove_file(path).unwrap();
     }
 }
